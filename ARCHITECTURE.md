@@ -9,6 +9,28 @@ NanoChat is a sophisticated transformer-based language model that incorporates a
 - Advanced training objectives including energy-based learning
 - Rust-accelerated tokenization (rustbpe)
 
+## Extended LLM Cognitive Framework
+
+This section outlines the new cognitive layers and features added to the nanochat LLM, along with their architectural connections.
+
+### Key Added Features
+1. **PsycheController** (`nanochat/engine.py`): Dynamically generates blending weights for the Id/Ego/Superego layers based on input context.
+2. **GPT Id/Ego/Superego Layers** (`nanochat/gpt.py`): Three distinct cognitive processing layers with specialized focuses (instinctual, practical, moral reasoning).
+3. **HypercubeEmbeddingLayer** (`nanochat/hypercube.py`): Maps concept IDs to embeddings within a hypercube structure, enabling semantic relationships.
+4. **LongTermMemory** (`nanochat/engine.py`): Stores and retrieves embeddings to preserve long-term context across generations.
+5. **AbacusEncoder & AbacusStateMemory** (`nanochat/abacus_encoder.py`/`nanochat/abacus_state_memory.py`): Ensures logical consistency of internal reasoning through structured pattern storage.
+6. **MemeticLearningLayer** (`nanochat/memetic_learning.py`): Evaluates the fitness of generated embeddings for knowledge retention.
+7. **ConsciousIntegrationLayer** (`nanochat/conscious_integration.py`): Synthesizes outputs from all lower layers into a unified conceptual state that directly influences model output.
+
+### Architecture Flow
+1. Input embeddings are processed through GPT's Id/Ego/Superego layers.
+2. PsycheController provides dynamic blending weights.
+3. LongTermMemory retrieves relevant context embeddings.
+4. AbacusEncoder ensures logical consistency of intermediate states.
+5. MemeticLearningLayer evaluates generated embedding fitness.
+6. ConsciousIntegrationLayer synthesizes all inputs into a unified state.
+7. Synthesized state modulates concept_logits for final output.
+
 ## Core Architecture
 
 ### 1. GPT Backbone (`nanochat/gpt.py`)
@@ -104,6 +126,23 @@ The model supports extensive configuration through:
 - Configuration files (`config/custom_config.py`)
 - Runtime parameter adjustment
 
+## Recursive Hierarchical Reasoning (RHR)
+
+NanoChat incorporates several key principles of Recursive Hierarchical Reasoning (RHR) to enhance its cognitive capabilities.
+
+### Current Implementation Overview
+1.  **Multi-Level Abstraction Layers**: The PsycheController architecture (`gpt.py`) utilizes Id, Ego, and Superego layers for raw, contextual, and ethical processing, respectively, with dynamic blending based on context.
+2.  **Semantic Hypercube Topology**: The Hypercube (`hypercube.py`) provides hierarchical concept organization through vertex embeddings and a continuous latent space, supporting autoregressive generation and energy-based reasoning.
+3.  **Conscious Integration Layer**: The Conscious Integration Layer (`conscious_integration.py`) synthesizes outputs from various sources, incorporates memory, ensures logical consistency via the Abacus encoder, and projects synthesized states to actionable outputs.
+4.  **Memetic Learning System**: The Memetic Learning Layer (`memetic_learning.py`) facilitates hierarchical knowledge evolution through fitness evaluation, concept mapping, and self-model updates.
+
+### RHR Implementation Strengths
+*   **Existing Hierarchical Features**: Three-tier processing (Id → Ego → Superego), semantic hypercube for multi-dimensional concept relationships, energy-based validation, conscious synthesis of multiple reasoning levels, and memetic evolution of concepts.
+*   **Recursive Elements**: Autoregressive latent generation, memory integration, dynamic weight blending, and recursive concept mapping.
+
+### Potential RHR Enhancements
+Future enhancements could include explicit recursive loops, hierarchical attention mechanisms, and a meta-reasoning layer.
+
 ## Performance Optimizations
 
 ### 1. Rust Integration
@@ -169,10 +208,10 @@ Multi-Loss Optimization
 ## Future Enhancements
 
 Potential areas for improvement:
-1. **KIMI Linear Attention**: Integration of linear attention mechanisms
-2. **Enhanced Consciousness**: More sophisticated self-modeling
-3. **Memory Augmentation**: Long-term memory capabilities
+1. **KIMI Linear Attention**: Integration of linear attention mechanisms.
+2. **Enhanced Consciousness**: More sophisticated self-modeling.
+3. **Memory Augmentation**: Long-term memory capabilities.
 4. **Multi-Modal**: Extension to handle images, audio, etc.
-5. **Efficiency**: Further optimization for inference speed
+5. **Efficiency**: Further optimization for inference speed.
 
 This architecture represents a significant advancement in transformer-based language models, incorporating psychological modeling, consciousness integration, and advanced training techniques.
