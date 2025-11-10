@@ -11,6 +11,7 @@ Notable features:
 - Multi-Query Attention (MQA) support for more efficient inference
 """
 
+import copy
 import math
 from functools import partial
 from dataclasses import dataclass
@@ -22,23 +23,52 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from nanochat.attention.kimi import KimiLinearAttention
+from nanochat.kv_cache import KVCache
 
 @dataclass
 class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # Using bias in Linears and LayerNorms
+    attention_type: str = "mha" # "mha" for MultiHeadSelfAttention, "kimi" for KimiLinearAttention
+    state_size: int = 128 # For KimiLinearAttention
+    rank: int = 16 # For KimiLinearAttention
+    chunk_size: int = 16 # For KimiLinearAttention
+
     def __init__(self,
+                 block_size=1024,
+                 vocab_size=50304,
                  n_layer=12,
                  n_head=12,
                  n_embd=768,
-                 sequence_len=1024,
-                 n_kv_head=None,
-                 num_concept_ids=50257, # Updated to match gpt2 tokenizer vocab size
-                 hypercube_dim=12, # Default hypercube dimension
-                 abacus_input_dim=64, # Default input dimension for the AbacusEncoder
                  dropout=0.0,
-                 bias=False,
+                 bias=True,
+                 attention_type="mha",
+                 state_size=128,
+                 rank=16,
+                 chunk_size=16,
+                 
+                 # For KimiLinearAttention
+                 decay_rate=0.999,
+                 clamp_val=1.0,
+                 
+                 # For Abacus
+                 num_concept_ids=1000,
+                 hypercube_dim=128,
+                 abacus_input_dim=256,
+                 
+                 # For RoPE
+                 rope_theta=10000,
+                 
+                 # For Muon
+                 n_kv_head=None,
                  multiple_of=256,
                  norm_eps=1e-5,
-                 rope_theta=10000,
                  
                  # For training
                  batch_size=1,
@@ -92,21 +122,26 @@ class GPTConfig:
                  ego_loss_weight=0.2, # New hyperparameter for deep supervision
                  superego_loss_weight=0.2, # New hyperparameter for deep supervision
                  **kwargs):
+        self.block_size = block_size
+        self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
-        self.embedding_dim = n_embd
-        self.sequence_len = sequence_len
-        self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
+        self.dropout = dropout
+        self.bias = bias
+        self.attention_type = attention_type
+        self.state_size = state_size
+        self.rank = rank
+        self.chunk_size = chunk_size
+        self.decay_rate = decay_rate
+        self.clamp_val = clamp_val
         self.num_concept_ids = num_concept_ids
         self.hypercube_dim = hypercube_dim
         self.abacus_input_dim = abacus_input_dim
-        self.dropout = dropout
-        self.bias = bias
+        self.rope_theta = rope_theta
+        self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
         self.multiple_of = multiple_of
         self.norm_eps = norm_eps
-        self.rope_theta = rope_theta
-        
         self.batch_size = batch_size
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_iters = max_iters
@@ -119,36 +154,29 @@ class GPTConfig:
         self.decay_lr = decay_lr
         self.warmup_iters = warmup_iters
         self.lr_decay_iters = lr_decay_iters
-        
         self.out_dir = out_dir
         self.eval_interval = eval_interval
         self.log_interval = log_interval
         self.eval_iters = eval_iters
         self.eval_only = eval_only
         self.always_save_checkpoint = always_save_checkpoint
-        
         self.backend = backend
-        
         self.device = device
         self.dtype = dtype
         self.compile = compile
-        
         self.dataset = dataset
-        
         self.init_from = init_from
-        
         self.chat = chat
-        
         self.concept_memory_size = concept_memory_size
         self.concept_memory_top_k = concept_memory_top_k
         self.use_concept_attention = use_concept_attention
-        
         self.psyche_id_lr_scale = psyche_id_lr_scale
         self.psyche_ego_lr_scale = psyche_ego_lr_scale
         self.psyche_superego_lr_scale = psyche_superego_lr_scale
-        
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+        self.id_loss_weight = id_loss_weight
+        self.ego_loss_weight = ego_loss_weight
+        self.superego_loss_weight = superego_loss_weight
+        self.__dict__.update(kwargs) # Capture any additional arguments
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
@@ -169,70 +197,56 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        if config.attention_type == "full":
+            self.attn = MultiHeadSelfAttention(config, layer_idx)
+        elif config.attention_type == "kimi":
+            self.attn = KimiLinearAttention(config)
+        else:
+            raise ValueError(f"Unknown attention type: {config.attention_type}")
 
     def forward(self, x, cos_sin, kv_cache, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None):
-        B, T, C = x.size()
-
-        # Project the input to get queries, keys, and values
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
-
-        # Apply KV cache: insert current k,v into cache, get the full view so far
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        # If episodic_kv is provided, prepend it to the current k and v
-        if episodic_kv is not None:
-            episode_k_layer = episodic_kv[self.layer_idx, 0]
-            episode_v_layer = episodic_kv[self.layer_idx, 1]
-            k = torch.cat([episode_k_layer, k], dim=2)
-            v = torch.cat([episode_v_layer, v], dim=2)
-
-        Tq = q.size(2) # number of queries in this forward pass
-        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
-
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        if isinstance(self.attn, KimiLinearAttention):
+            output, state = self.attn(x, cos_sin, kv_cache, episodic_kv)
+            # For KimiLinearAttention, the 'state' is the new 'kv_cache' for the next layer/timestep
+            # We need to pass this state up, so we'll return it as the updated episodic_kv
+            return output, (state,)
         else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            # First, each query attends to all the cached keys/values (i.e. full prefix)
-            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
-            prefix_len = Tk - Tq
-            if prefix_len > 0: # can't be negative but could be zero
-                attn_mask[:, :prefix_len] = True
-            # Then, causal attention within this chunk
-            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            return self.attn(x, cos_sin, kv_cache, episodic_kv), None # MultiHeadSelfAttention doesn't return a state
 
-        # Re-assemble the heads side by side and project back to residual stream
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+        
+        
+        
+
+        
+            
+
+        
+        
+            
+            
+            
+            
+
+        
+        
+
+        
+        
+        
+            
+            
+                
+            
+            
+            
+            
+            
+
+        
+        
+        
+
 
 
 class MLP(nn.Module):
@@ -251,13 +265,15 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.layer_idx = layer_idx
+        self.attn = KimiLinearAttention(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None):
-        x = x + self.attn(norm(x), cos_sin, kv_cache, episodic_kv)
+    def forward(self, x, cos_sin, kv_cache, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, state: torch.Tensor | None = None):
+        attn_output, state = self.attn(norm(x), cos_sin, kv_cache, episodic_kv, state, self.layer_idx)
+        x = x + attn_output
         x = x + self.mlp(norm(x))
-        return x
+        return x, state
 
 
 class PsycheController(nn.Module):
@@ -274,11 +290,20 @@ class PsycheController(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, kv_cache=None):
         super().__init__()
         self.config = config
+        self.kv_cache = kv_cache
+
+        # Assign attention types layer-wise
+        h_blocks = []
+        for layer_idx in range(config.n_layer):
+            layer_config = copy.deepcopy(self.config) # Start with a copy of the main config
+            layer_config.attention_type = "kimi"  # Use KimiLinearAttention
+            h_blocks.append(Block(layer_config, layer_idx))
+
         self.transformer = nn.ModuleDict({
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList(h_blocks),
         })
 
         # Partition transformer layers into psyche layers
@@ -350,7 +375,7 @@ class GPT(nn.Module):
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
+        cos, sin = cos[None, :, None, :].repeat(1, 1, 1, 2), sin[None, :, None, :].repeat(1, 1, 1, 2) # add batch and head dims for later broadcasting and expand to full head_dim
         return cos, sin
 
     def get_device(self):
@@ -406,26 +431,38 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def _run_layers(self, layers, x, cos_sin, kv_cache, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None):
+    def _run_layers(self, layers, x, cos_sin, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, state: torch.Tensor | None = None):
         for block in layers:
-            x = block(x, cos_sin, kv_cache, episodic_kv)
-        return x
+            x, state = block(x, cos_sin, self.kv_cache, episodic_kv, state)
+        return x, state
 
-    def forward(self, input_embeddings: torch.Tensor, kv_cache=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
+    def forward(self, input_embeddings: torch.Tensor, kv_cache_param=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
         B, T, C = input_embeddings.size()
+
+        if kv_cache_param is not None:
+            self.kv_cache = kv_cache_param
+        elif self.kv_cache is None:
+            # Initialize KVCache if not provided
+            num_heads = self.config.n_head
+            head_dim = self.config.n_embd // num_heads
+            num_layers = self.config.n_layer
+            state_size = self.config.state_size
+            device = input_embeddings.device
+            self.kv_cache = KVCache(B, num_heads, T, head_dim, num_layers, self.config.attention_type, state_size, device)
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         cos_sin = self.cos[:, :T, :, :], self.sin[:, :T, :, :]
 
         x = input_embeddings
+        state = None # Initialize state for KimiLinearAttention
 
         # Generate psyche weights if not provided
         if psyche_weights is None:
             psyche_weights = self.psyche_controller(x)
 
         # Process Id layers
-        x_id = self._run_layers(self.id_layers, x, cos_sin, kv_cache, episodic_kv)
+        x_id, state = self._run_layers(self.id_layers, x, cos_sin, episodic_kv, state)
 
         # Process Ego layers
         x_ego = x_id
@@ -439,7 +476,7 @@ class GPT(nn.Module):
             # Assuming long_term_memory_embeddings is (B, C) and x_ego is (B, T, C)
             long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_ego.size(1), -1)
             x_ego = x_ego + long_term_memory_broadcast # Inject long_term_memory_embeddings into ego layer
-        x_ego = self._run_layers(self.ego_layers, x_ego, cos_sin, kv_cache, episodic_kv)
+        x_ego, state = self._run_layers(self.ego_layers, x_ego, cos_sin, episodic_kv, state)
 
         # Process Superego layers
         x_superego = x_ego
@@ -448,7 +485,7 @@ class GPT(nn.Module):
             # Assuming long_term_memory_embeddings is (B, C) and x_superego is (B, T, C)
             long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
             x_superego = x_superego + long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
-            x_superego = self._run_layers(self.superego_layers, x_superego, cos_sin, kv_cache, episodic_kv)
+        x_superego, state = self._run_layers(self.superego_layers, x_superego, cos_sin, episodic_kv, state)
 
         # Apply auxiliary heads to the outputs of each psyche layer
         id_logits = self.id_head(x_id)
@@ -464,19 +501,35 @@ class GPT(nn.Module):
 
         # Final concept head for the blended output
         x = norm(x)
-        return self.concept_head(x), kv_cache, id_logits, ego_logits, superego_logits
+        return self.concept_head(x), self.kv_cache, id_logits, ego_logits, superego_logits
 
-    def forward_prefill(self, input_embeddings: torch.Tensor, kv_cache=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
+    def forward_prefill(self, input_embeddings: torch.Tensor, kv_cache_param=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
         B, T, C = input_embeddings.size()
+
+        if kv_cache_param is not None:
+            self.kv_cache = kv_cache_param
+        elif self.kv_cache is None:
+            # Initialize KVCache if not provided
+            num_heads = self.config.n_head
+            head_dim = self.config.n_embd // num_heads
+            num_layers = self.config.n_layer
+            state_size = self.config.state_size
+            device = input_embeddings.device
+            self.kv_cache = KVCache(B, num_heads, T, head_dim, num_layers, self.config.attention_type, state_size, device)
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         cos_sin = self.cos[:, :T, :, :], self.sin[:, :T, :, :]
 
         x = input_embeddings
+        state = None # Initialize state for KimiLinearAttention
+
+        # Generate psyche weights if not provided
+        if psyche_weights is None:
+            psyche_weights = self.psyche_controller(x)
 
         # Process Id layers
-        x_id = self._run_layers(self.id_layers, x, cos_sin, kv_cache, episodic_kv)
+        x_id, state = self._run_layers(self.id_layers, x, cos_sin, episodic_kv, state)
 
         # Process Ego layers
         x_ego = x_id
@@ -490,7 +543,7 @@ class GPT(nn.Module):
             # Assuming long_term_memory_embeddings is (B, C) and x_ego is (B, T, C)
             long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_ego.size(1), -1)
             x_ego = x_ego + long_term_memory_broadcast # Inject long_term_memory_embeddings into ego layer
-        x_ego = self._run_layers(self.ego_layers, x_ego, cos_sin, kv_cache, episodic_kv)
+        x_ego, state = self._run_layers(self.ego_layers, x_ego, cos_sin, episodic_kv, state)
 
         # Process Superego layers
         x_superego = x_ego
@@ -499,33 +552,44 @@ class GPT(nn.Module):
             # Assuming long_term_memory_embeddings is (B, C) and x_superego is (B, T, C)
             long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
             x_superego = x_superego + long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
-            x_superego = self._run_layers(self.superego_layers, x_superego, cos_sin, kv_cache, episodic_kv)
+        x_superego, state = self._run_layers(self.superego_layers, x_superego, cos_sin, episodic_kv, state)
 
-        # Dynamically blend the outputs based on psyche_weights
-        # Reshape psyche_weights for broadcasting: (B, 1, 3)
-        psyche_weights_reshaped = psyche_weights.unsqueeze(1)
+        # Apply auxiliary heads to the outputs of each psyche layer
+        id_logits = self.id_head(x_id)
+        ego_logits = self.ego_head(x_ego)
+        superego_logits = self.superego_head(x_superego)
 
-        # Stack the outputs and apply weighted sum
-        # Stack will result in (B, T, 3, C)
-        stacked_outputs = torch.stack([x_id, x_ego, x_superego], dim=2)
-        # Weighted sum: (B, T, 1, C) after sum, then squeeze to (B, T, C)
-        x = (stacked_outputs * psyche_weights_reshaped.unsqueeze(-1)).sum(dim=2)
+        # Blend the outputs of the psyche layers using psyche_weights
+        # For now, we'll use the final output of the last layer for concept_head
+        # In the future, this will be a weighted sum based on psyche_weights
+        x = x_id * psyche_weights[:, 0].unsqueeze(1).unsqueeze(2) + \
+            x_ego * psyche_weights[:, 1].unsqueeze(1).unsqueeze(2) + \
+            x_superego * psyche_weights[:, 2].unsqueeze(1).unsqueeze(2)
 
-        # Final concept head
-        return self.concept_head(x), kv_cache, x_id, x_ego, x_superego
+        # Final concept head for the blended output
+        x = norm(x)
+        return self.concept_head(x), self.kv_cache, id_logits, ego_logits, superego_logits
 
-    def forward_step(self, next_embedding: torch.Tensor, kv_cache, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
+    def forward_step(self, next_embedding: torch.Tensor, kv_cache_param=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
         B, C = next_embedding.size()
-        T = kv_cache[0].size(1) + 1 # Current sequence length after adding next_embedding
+        T = self.kv_cache.current_seq_len + 1 # Current sequence length after adding next_embedding
+
+        if kv_cache_param is not None:
+            self.kv_cache = kv_cache_param
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         cos_sin = self.cos[:, T-1:T, :, :], self.sin[:, T-1:T, :, :]
 
         x = next_embedding.unsqueeze(1) # Add sequence dimension for consistency
+        state = None # Initialize state for KimiLinearAttention
+
+        # Generate psyche weights if not provided
+        if psyche_weights is None:
+            psyche_weights = self.psyche_controller(x)
 
         # Process Id layers
-        x_id = self._run_layers(self.id_layers, x, cos_sin, kv_cache, episodic_kv)
+        x_id, state = self._run_layers(self.id_layers, x, cos_sin, episodic_kv, state)
 
         # Process Ego layers
         x_ego = x_id
@@ -539,7 +603,7 @@ class GPT(nn.Module):
             # Assuming long_term_memory_embeddings is (B, C) and x_ego is (B, T, C)
             long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_ego.size(1), -1)
             x_ego = x_ego + long_term_memory_broadcast # Inject long_term_memory_embeddings into ego layer
-        x_ego = self._run_layers(self.ego_layers, x_ego, cos_sin, kv_cache, episodic_kv)
+        x_ego, state = self._run_layers(self.ego_layers, x_ego, cos_sin, episodic_kv, state)
 
         # Process Superego layers
         x_superego = x_ego
@@ -548,7 +612,23 @@ class GPT(nn.Module):
             # Assuming long_term_memory_embeddings is (B, C) and x_superego is (B, T, C)
             long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
             x_superego = x_superego + long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
-            x_superego = self._run_layers(self.superego_layers, x_superego, cos_sin, kv_cache, episodic_kv)
+        x_superego, state = self._run_layers(self.superego_layers, x_superego, cos_sin, episodic_kv, state)
+
+        # Apply auxiliary heads to the outputs of each psyche layer
+        id_logits = self.id_head(x_id)
+        ego_logits = self.ego_head(x_ego)
+        superego_logits = self.superego_head(x_superego)
+
+        # Blend the outputs of the psyche layers using psyche_weights
+        # For now, we'll use the final output of the last layer for concept_head
+        # In the future, this will be a weighted sum based on psyche_weights
+        x = x_id * psyche_weights[:, 0].unsqueeze(1).unsqueeze(2) + \
+            x_ego * psyche_weights[:, 1].unsqueeze(1).unsqueeze(2) + \
+            x_superego * psyche_weights[:, 2].unsqueeze(1).unsqueeze(2)
+
+        # Final concept head for the blended output
+        x = norm(x)
+        return self.concept_head(x.squeeze(1)), self.kv_cache, id_logits, ego_logits, superego_logits
 
         # Dynamically blend the outputs based on psyche_weights
         if psyche_weights is None:
@@ -562,5 +642,5 @@ class GPT(nn.Module):
         # Weighted sum: (B, T, 1, C) after sum, then squeeze to (B, T, C)
         x = (stacked_outputs * psyche_weights_reshaped.unsqueeze(-1)).sum(dim=2)
 
-        x = norm(x)
-        return self.concept_head(x.squeeze(1)), kv_cache, x_id, x_ego, x_superego
+        # Final concept head
+        return self.concept_head(x), self.kv_cache, x_id, x_ego, x_superego
