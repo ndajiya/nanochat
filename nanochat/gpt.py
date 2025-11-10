@@ -28,13 +28,14 @@ from nanochat.kv_cache import KVCache
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab size of 50257, padded up to nearest multiple of 64 for efficiency
+    block_size: int = 16000 # was 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # Using bias in Linears and LayerNorms
+    dropout: float = 0.1
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rotary_seq_len: int = 16384
     attention_type: str = "mha" # "mha" for MultiHeadSelfAttention, "kimi" for KimiLinearAttention
     state_size: int = 128 # For KimiLinearAttention
     rank: int = 16 # For KimiLinearAttention
