@@ -16,6 +16,8 @@ import math
 from functools import partial
 from dataclasses import dataclass
 
+from typing import Optional, List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +27,104 @@ from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 from nanochat.attention.kimi import KimiLinearAttention
 from nanochat.kv_cache import KVCache
+
+class LayerNorm(nn.Module):
+    """ LayerNorm but with an optional bias. PyTorch's LayerNorm
+        doesn't support bias=False
+    """
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a single batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make fast and easy
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                 .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x, cos_sin, episodic_kv=None, state=None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # apply rotary embeddings
+        cos, sin = cos_sin
+        q = apply_rotary_pos_emb(q, cos, sin)
+        k = apply_rotary_pos_emb(k, cos, sin)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            attn = attn.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            attn = attn @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+
+        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
+
+        # output projection
+        attn = self.resid_dropout(self.c_proj(attn))
+        return attn
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = MultiHeadSelfAttention(config) if config.attention_type == "mha" else KimiLinearAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x, cos_sin, episodic_kv=None, state=None):
+        x = x + self.attn(self.ln_1(x), cos_sin, episodic_kv, state)
+        x = x + self.mlp(self.ln_2(x))
+        return x, state
 
 @dataclass
 class GPTConfig:
@@ -36,6 +136,13 @@ class GPTConfig:
     dropout: float = 0.1
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     rotary_seq_len: int = 16384
+    # LongRoPE additions:
+    rotary_base: float = 10000.0  # same as usual RoPE base
+    rotary_rescale_factors: Optional[torch.Tensor] = None  # shape (rotary_dim,)
+    rotary_rescale_headwise: bool = False  # if using per-head vs per-dim
+    rotary_short_threshold: int = 8192  # length under which we use short-readjust factors
+    # progressive strategy
+    longrope_stages: List[int] = [256_000, 2_048_000]  # staged target lengths
     attention_type: str = "mha" # "mha" for MultiHeadSelfAttention, "kimi" for KimiLinearAttention
     state_size: int = 128 # For KimiLinearAttention
     rank: int = 16 # For KimiLinearAttention
@@ -161,181 +268,177 @@ class GPTConfig:
         self.eval_iters = eval_iters
         self.eval_only = eval_only
         self.always_save_checkpoint = always_save_checkpoint
-        self.backend = backend
-        self.device = device
-        self.dtype = dtype
-        self.compile = compile
-        self.dataset = dataset
-        self.init_from = init_from
-        self.chat = chat
-        self.concept_memory_size = concept_memory_size
-        self.concept_memory_top_k = concept_memory_top_k
-        self.use_concept_attention = use_concept_attention
-        self.psyche_id_lr_scale = psyche_id_lr_scale
-        self.psyche_ego_lr_scale = psyche_ego_lr_scale
-        self.psyche_superego_lr_scale = psyche_superego_lr_scale
-        self.id_loss_weight = id_loss_weight
-        self.ego_loss_weight = ego_loss_weight
-        self.superego_loss_weight = superego_loss_weight
-        self.__dict__.update(kwargs) # Capture any additional arguments
-
-def norm(x):
-    # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    out = torch.cat([y1, y2], 3) # re-assemble
-    out = out.to(x.dtype) # ensure input/output dtypes match
-    return out
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-
-        if config.attention_type == "full":
-            self.attn = MultiHeadSelfAttention(config, layer_idx)
-        elif config.attention_type == "kimi":
-            self.attn = KimiLinearAttention(config)
-        else:
-            raise ValueError(f"Unknown attention type: {config.attention_type}")
-
-    def forward(self, x, cos_sin, kv_cache, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None):
-        if isinstance(self.attn, KimiLinearAttention):
-            output, state = self.attn(x, cos_sin, kv_cache, episodic_kv)
-            # For KimiLinearAttention, the 'state' is the new 'kv_cache' for the next layer/timestep
-            # We need to pass this state up, so we'll return it as the updated episodic_kv
-            return output, (state,)
-        else:
-            return self.attn(x, cos_sin, kv_cache, episodic_kv), None # MultiHeadSelfAttention doesn't return a state
-
         
-        
-        
-
-        
+        # LongRoPE specific configurations
+        rotary_seq_len: int = 16384, # Largest precomputed length
+        rotary_rescale_factors: list[float] | None = None,
+        rotary_critical_dim: int | None = None,
+        rotary_interpolation_strategy: str = "uniform", # 'uniform' | 'non_uniform' | 'second_interpolation'
+        longrope_progressive_stages: list[int] | None = None,
+        rotary_readjust_short_k: bool = False,
+        rotary_readjust_lengths: list[int] | None = None,
+        rotary_readjust_map: dict | None = None,
+        **kwargs):
+            self.block_size = block_size
+            self.vocab_size = vocab_size
+            self.n_layer = n_layer
+            self.n_head = n_head
+            self.n_embd = n_embd
+            self.dropout = dropout
+            self.bias = bias
+            self.attention_type = attention_type
+            self.state_size = state_size
+            self.rank = rank
+            self.chunk_size = chunk_size
+            self.decay_rate = decay_rate
+            self.clamp_val = clamp_val
+            self.num_concept_ids = num_concept_ids
+            self.hypercube_dim = hypercube_dim
+            self.abacus_input_dim = abacus_input_dim
+            self.rope_theta = rope_theta
+            self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
+            self.multiple_of = multiple_of
+            self.norm_eps = norm_eps
+            self.batch_size = batch_size
+            self.gradient_accumulation_steps = gradient_accumulation_steps
+            self.max_iters = max_iters
+            self.lr = lr
+            self.min_lr = min_lr
+            self.weight_decay = weight_decay
+            self.beta1 = beta1
+            self.beta2 = beta2
+            self.grad_clip = grad_clip
+            self.decay_lr = decay_lr
+            self.warmup_iters = warmup_iters
+            self.lr_decay_iters = lr_decay_iters
+            self.out_dir = out_dir
+            self.eval_interval = eval_interval
+            self.log_interval = log_interval
+            self.eval_iters = eval_iters
+            self.eval_only = eval_only
+            self.always_save_checkpoint = always_save_checkpoint
             
-
-        
-        
-            
-            
-            
-            
-
-        
-        
-
-        
-        
-        
-            
-            
-                
-            
-            
-            
-            
-            
-
-        
-        
-        
-
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.attn = KimiLinearAttention(config)
-        self.mlp = MLP(config)
-
-    def forward(self, x, cos_sin, kv_cache, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, state: torch.Tensor | None = None):
-        attn_output, state = self.attn(norm(x), cos_sin, kv_cache, episodic_kv, state, self.layer_idx)
-        x = x + attn_output
-        x = x + self.mlp(norm(x))
-        return x, state
-
-
-class PsycheController(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.controller_head = nn.Linear(config.n_embd, 3) # 3 for id, ego, superego
-
-    def forward(self, x):
-        # For now, just return equal weights for each psyche layer
-        # In the future, this will be trained to dynamically blend psyche outputs
-        # Average x over the sequence dimension to get (B, C)
-        x_averaged = x.mean(dim=1)
-        return torch.softmax(self.controller_head(x_averaged), dim=-1)
+            # LongRoPE specific configurations
 
 
 class GPT(nn.Module):
-    def __init__(self, config, kv_cache=None):
+    def __init__(self, config):
         super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
         self.config = config
-        self.kv_cache = kv_cache
 
-        # Assign attention types layer-wise
-        h_blocks = []
-        for layer_idx in range(config.n_layer):
-            layer_config = copy.deepcopy(self.config) # Start with a copy of the main config
-            layer_config.attention_type = "kimi"  # Use KimiLinearAttention
-            h_blocks.append(Block(layer_config, layer_idx))
+        # token embeddings
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd)
+        ))
 
-        self.transformer = nn.ModuleDict({
-            "h": nn.ModuleList(h_blocks),
-        })
+        # psyche layers
+        self.id_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ego_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.superego_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
-        # Partition transformer layers into psyche layers
-        total_layers = config.n_layer
-        id_end = total_layers // 3
-        ego_end = 2 * total_layers // 3
+        # psyche heads
+        self.id_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.ego_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.superego_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        self.id_layers = self.transformer.h[:id_end]
-        self.ego_layers = self.transformer.h[id_end:ego_end]
-        self.superego_layers = self.transformer.h[ego_end:]
+        # concept head
+        self.concept_head = nn.Linear(config.n_embd, config.num_concept_ids, bias=False)
 
-        self.psyche_registry = {
-            "id": self.id_layers,
-            "ego": self.ego_layers,
-            "superego": self.superego_layers
-        }
+        # psyche controller
+        self.psyche_controller = nn.Linear(config.n_embd, 3, bias=False) # 3 for id, ego, superego
 
-        self.concept_head = nn.Linear(config.n_embd, config.num_concept_ids, bias=False) # New concept head
-        self.psyche_controller = PsycheController(config) # Initialize PsycheController
-        self.id_head = nn.Linear(config.n_embd, config.num_concept_ids, bias=False)
-        self.ego_head = nn.Linear(config.n_embd, config.num_concept_ids, bias=False)
-        self.superego_head = nn.Linear(config.n_embd, config.num_concept_ids, bias=False)
-        # To support meta device initialization, we init the rotary embeddings here, but it's fake
-        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
-        # so let's just over-compute them, but assert fail if we ever reach that amount.
-        # In the future we can dynamically grow the cache, for now it's fine.
-        self.rotary_seq_len = 16384 # 10X over-compute should be enough, TODO make nicer?
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
-        self.register_buffer("sin", sin, persistent=False)
+        # kv cache
+        self.kv_cache = KVCache(config.block_size, config.n_head, config.n_embd // config.n_head, config.batch_size)
+
+        # rotary embeddings
+        self.init_rotary_cache(self.config.rotary_seq_len, self.get_device())
+
+    def init_rotary_cache(self, max_seq_len: int, device: str):
+        head_dim = self.config.n_embd // self.config.n_head
+
+        # Precompute LongRoPE scaled embeddings
+        cos_longrope, sin_longrope = self.build_rotary_cos_sin(
+            max_seq_len,
+            head_dim,
+            device,
+            base=self.config.rotary_base,
+            rescale_factors=self.config.rotary_rescale_factors,
+            longrope_progressive_stages=self.config.longrope_progressive_stages,
+            rotary_interpolation_strategy=self.config.rotary_interpolation_strategy
+        )
+        self.register_buffer("cos_longrope", cos_longrope, persistent=False)
+        self.register_buffer("sin_longrope", sin_longrope, persistent=False)
+
+        # Precompute original RoPE embeddings and readjusted ones if configured
+        if self.config.rotary_readjust_short_k and self.config.rotary_readjust_map is not None and self.config.rotary_readjust_lengths is not None:
+            self.cos_readjusted = {}
+            self.sin_readjusted = {}
+            for length in self.config.rotary_readjust_lengths:
+                if length in self.config.rotary_readjust_map:
+                    readjust_factors = torch.tensor(self.config.rotary_readjust_map[length], dtype=torch.float32)
+                    cos_adj, sin_adj = self.build_rotary_cos_sin(
+                        length,
+                        head_dim,
+                        device,
+                        base=self.config.rotary_base,
+                        rescale_factors=readjust_factors
+                    )
+                    self.cos_readjusted[length] = cos_adj
+                    self.sin_readjusted[length] = sin_adj
+                else:
+                    # Fallback to original if no specific readjustment factors are found
+                    cos_original, sin_original = self.build_rotary_cos_sin(
+                        max_seq_len,
+                        head_dim,
+                        device,
+                        base=self.config.rotary_base
+                    )
+                    self.register_buffer("cos_original", cos_original, persistent=False)
+                    self.register_buffer("sin_original", sin_original, persistent=False)
+        else:
+            cos_original, sin_original = self.build_rotary_cos_sin(
+                max_seq_len,
+                head_dim,
+                device,
+                base=self.config.rotary_base
+            )
+            self.register_buffer("cos_original", cos_original, persistent=False)
+            self.register_buffer("sin_original", sin_original, persistent=False)
+
+    def get_device(self):
+        # Get device from concept_head weight
+        return self.concept_head.weight.device
+
+    # TODO: bump base theta more, e.g. 100K is more common more recently
+    def build_rotary_cos_sin(self, max_seq_len: int, head_dim: int, device: str, base: float, rescale_factors: torch.Tensor | None = None, longrope_progressive_stages: list[int] | None = None, rotary_interpolation_strategy: str | None = None):
+        # Original RoPE frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device) / head_dim))
+
+        # Apply rescale factors if provided
+        if rescale_factors is not None:
+            if rescale_factors.shape[0] != head_dim // 2:
+                raise ValueError(f"rescale_factors shape mismatch. Expected ({head_dim // 2},), got {rescale_factors.shape}")
+            inv_freq = inv_freq * rescale_factors.to(device)
+
+        # Apply LongRoPE modifications if configured
+        if longrope_progressive_stages is not None and rotary_interpolation_strategy == "non_uniform":
+            rescale_map = torch.ones_like(inv_freq)
+            current_seq_len = 0
+            for i, stage_len in enumerate(longrope_progressive_stages):
+                if current_seq_len < max_seq_len:
+                    factor = rescale_factors[i] if rescale_factors is not None and i < len(rescale_factors) else 1.0
+                    rescale_map[current_seq_len:min(current_seq_len + stage_len, max_seq_len)] *= factor
+                current_seq_len += stage_len
+            inv_freq = inv_freq * rescale_map
+
+        t = torch.arange(max_seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().view(1, max_seq_len, 1, head_dim)
+        sin = emb.sin().view(1, max_seq_len, 1, head_dim)
+        return cos, sin
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -345,10 +448,8 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-        # init the rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
+        # Initialize rotary cache
+        self.init_rotary_cache(self.config.rotary_seq_len, self.get_device())
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -362,26 +463,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
 
-    # TODO: bump base theta more, e.g. 100K is more common more recently
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        # autodetect the device from model embeddings
-        if device is None:
-            device = self.concept_head.weight.device
-        # stride the channels
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        # stride the time steps
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
-        cos, sin = cos[None, :, None, :].repeat(1, 1, 1, 2), sin[None, :, None, :].repeat(1, 1, 1, 2) # add batch and head dims for later broadcasting and expand to full head_dim
-        return cos, sin
 
-    def get_device(self):
-        # Get device from concept_head weight
-        return self.concept_head.weight.device
 
     def estimate_flops(self):
         """ Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 """
@@ -437,92 +519,43 @@ class GPT(nn.Module):
             x, state = block(x, cos_sin, self.kv_cache, episodic_kv, state)
         return x, state
 
-    def forward(self, input_embeddings: torch.Tensor, kv_cache_param=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
-        B, T, C = input_embeddings.size()
+    def forward(self, idx, targets=None, input_embeddings=None, kv_cache=None, abacus_embedding=None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        if kv_cache_param is not None:
-            self.kv_cache = kv_cache_param
-        elif self.kv_cache is None:
-            # Initialize KVCache if not provided
-            num_heads = self.config.n_head
-            head_dim = self.config.n_embd // num_heads
-            num_layers = self.config.n_layer
-            state_size = self.config.state_size
-            device = input_embeddings.device
-            self.kv_cache = KVCache(B, num_heads, T, head_dim, num_layers, self.config.attention_type, state_size, device)
+        # If input_embeddings are provided, use them directly
+        if input_embeddings is not None:
+            x = input_embeddings
+        else:
+            # token embeddings of shape (B, T, C)
+            x = self.transformer.wte(idx)
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        cos_sin = self.cos[:, :T, :, :], self.sin[:, :T, :, :]
+        # Determine which rotary embeddings to use
+        if self.config.rotary_readjust_short_k and self.config.rotary_readjust_map is not None and self.config.rotary_readjust_lengths is not None:
+            cos_sin_selected = None
+            for length in self.config.rotary_readjust_lengths:
+                if T == length and length in self.cos_readjusted:
+                    cos_sin_selected = (self.cos_readjusted[length], self.sin_readjusted[length])
+                    break
+            if cos_sin_selected is None:
+                if T < self.config.rotary_short_threshold:
+                    cos_sin_selected = (self.cos_original, self.sin_original)
+                else:
+                    cos_sin_selected = (self.cos_longrope, self.sin_longrope)
+        else:
+            if T < self.config.rotary_short_threshold:
+                cos_sin_selected = (self.cos_original, self.sin_original)
+            else:
+                cos_sin_selected = (self.cos_longrope, self.sin_longrope)
 
-        x = input_embeddings
-        state = None # Initialize state for KimiLinearAttention
+        # Slice the selected rotary embeddings to the current sequence length
+        cos, sin = cos_sin_selected
+        cos_sin = (cos[:, :T, :, :], sin[:, :T, :, :])
 
-        # Generate psyche weights if not provided
-        if psyche_weights is None:
-            psyche_weights = self.psyche_controller(x)
+        # If kv_cache is provided, use it
+        if kv_cache is not None:
+            self.kv_cache = kv_cache
 
-        # Process Id layers
-        x_id, state = self._run_layers(self.id_layers, x, cos_sin, episodic_kv, state)
-
-        # Process Ego layers
-        x_ego = x_id
-        if abacus_embedding is not None:
-            # Broadcast abacus_embedding to match the sequence length of x_ego
-            # Assuming abacus_embedding is (B, C) and x_ego is (B, T, C)
-            abacus_broadcast = abacus_embedding.unsqueeze(1).expand(-1, x_ego.size(1), -1)
-            x_ego = x_ego + abacus_broadcast # Inject abacus_embedding into ego layer
-        if long_term_memory_embeddings is not None:
-            # Broadcast long_term_memory_embeddings to match the sequence length of x_ego
-            # Assuming long_term_memory_embeddings is (B, C) and x_ego is (B, T, C)
-            long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_ego.size(1), -1)
-            x_ego = x_ego + long_term_memory_broadcast # Inject long_term_memory_embeddings into ego layer
-        x_ego, state = self._run_layers(self.ego_layers, x_ego, cos_sin, episodic_kv, state)
-
-        # Process Superego layers
-        x_superego = x_ego
-        if long_term_memory_embeddings is not None:
-            # Broadcast long_term_memory_embeddings to match the sequence length of x_superego
-            # Assuming long_term_memory_embeddings is (B, C) and x_superego is (B, T, C)
-            long_term_memory_broadcast = long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
-            x_superego = x_superego + long_term_memory_embeddings.unsqueeze(1).expand(-1, x_superego.size(1), -1)
-        x_superego, state = self._run_layers(self.superego_layers, x_superego, cos_sin, episodic_kv, state)
-
-        # Apply auxiliary heads to the outputs of each psyche layer
-        id_logits = self.id_head(x_id)
-        ego_logits = self.ego_head(x_ego)
-        superego_logits = self.superego_head(x_superego)
-
-        # Blend the outputs of the psyche layers using psyche_weights
-        # For now, we'll use the final output of the last layer for concept_head
-        # In the future, this will be a weighted sum based on psyche_weights
-        x = x_id * psyche_weights[:, 0].unsqueeze(1).unsqueeze(2) + \
-            x_ego * psyche_weights[:, 1].unsqueeze(1).unsqueeze(2) + \
-            x_superego * psyche_weights[:, 2].unsqueeze(1).unsqueeze(2)
-
-        # Final concept head for the blended output
-        x = norm(x)
-        return self.concept_head(x), self.kv_cache, id_logits, ego_logits, superego_logits
-
-    def forward_prefill(self, input_embeddings: torch.Tensor, kv_cache_param=None, abacus_embedding: torch.Tensor | None = None, episodic_kv: tuple[torch.Tensor, torch.Tensor] | None = None, long_term_memory_embeddings: torch.Tensor | None = None, psyche_weights: torch.Tensor | None = None):
-        B, T, C = input_embeddings.size()
-
-        if kv_cache_param is not None:
-            self.kv_cache = kv_cache_param
-        elif self.kv_cache is None:
-            # Initialize KVCache if not provided
-            num_heads = self.config.n_head
-            head_dim = self.config.n_embd // num_heads
-            num_layers = self.config.n_layer
-            state_size = self.config.state_size
-            device = input_embeddings.device
-            self.kv_cache = KVCache(B, num_heads, T, head_dim, num_layers, self.config.attention_type, state_size, device)
-
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        cos_sin = self.cos[:, :T, :, :], self.sin[:, :T, :, :]
-
-        x = input_embeddings
         state = None # Initialize state for KimiLinearAttention
 
         # Generate psyche weights if not provided
@@ -578,9 +611,27 @@ class GPT(nn.Module):
         if kv_cache_param is not None:
             self.kv_cache = kv_cache_param
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        cos_sin = self.cos[:, T-1:T, :, :], self.sin[:, T-1:T, :, :]
+        # Determine which rotary embeddings to use for forward_step
+        if self.config.rotary_readjust_short_k and self.config.rotary_readjust_map is not None and self.config.rotary_readjust_lengths is not None:
+            cos_sin_selected = None
+            for length in self.config.rotary_readjust_lengths:
+                if T == length and length in self.cos_readjusted:
+                    cos_sin_selected = (self.cos_readjusted[length], self.sin_readjusted[length])
+                    break
+            if cos_sin_selected is None:
+                if T < self.config.rotary_short_threshold:
+                    cos_sin_selected = (self.cos_original, self.sin_original)
+                else:
+                    cos_sin_selected = (self.cos_longrope, self.sin_longrope)
+        else:
+            if T < self.config.rotary_short_threshold:
+                cos_sin_selected = (self.cos_original, self.sin_original)
+            else:
+                cos_sin_selected = (self.cos_longrope, self.sin_longrope)
+
+        # Slice the selected rotary embeddings to the current sequence length
+        cos, sin = cos_sin_selected
+        cos_sin = (cos[:, T-1:T, :, :], sin[:, T-1:T, :, :])
 
         x = next_embedding.unsqueeze(1) # Add sequence dimension for consistency
         state = None # Initialize state for KimiLinearAttention

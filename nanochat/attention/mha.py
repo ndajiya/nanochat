@@ -27,11 +27,20 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
+        # Determine offset for rotary embeddings
+        offset = kv_cache.get_seq_len(self.layer_idx) if kv_cache is not None else 0
+
+        # Transpose q, k, v to (B, n_head, T, head_dim) for attention operations
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
-        q, k = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+        q, k = apply_rotary_emb(q, k, cos, sin, T, offset)
+
+        # Apply QK norm
+        q, k = norm(q), norm(k)
 
         # Apply KV cache: insert current k,v into cache, get the full view so far
         if kv_cache is not None:

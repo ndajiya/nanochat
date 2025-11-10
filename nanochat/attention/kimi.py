@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from nanochat.gpt import apply_rotary_emb # Import apply_rotary_emb
 
 class KimiLinearAttention(nn.Module):
     def __init__(self, config):
@@ -10,6 +11,7 @@ class KimiLinearAttention(nn.Module):
         self.rank = config.rank
         self.chunk_size = config.chunk_size # Get chunk_size from config
         self.n_head = config.n_head # Get n_head from config
+        self.head_dim = self.d_model // self.n_head # Add head_dim
 
         # DPLR parameters
         self.U = nn.Parameter(torch.randn(self.state_size, self.rank))
@@ -78,16 +80,19 @@ class KimiLinearAttention(nn.Module):
         v = self.to_v(x) # (B, T, d_model)
 
         # Reshape k and v for rotary embeddings
-        k = k.view(B, T, self.n_head, D // self.n_head)
-        v = v.view(B, T, self.n_head, D // self.n_head)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, n_head, T, head_dim)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, n_head, T, head_dim)
 
-        # Apply Rotary Embeddings
-        k = k * cos_sin[0] + k * cos_sin[1]
-        v = v * cos_sin[0] + v * cos_sin[1]
+        # Apply Rotary Embeddings using the imported function
+        cos, sin = cos_sin # Unpack cos_sin
+        # In Kimi, there isn't an explicit 'q' in the same way as MHA.
+        # We apply RoPE to k and v. For the apply_rotary_emb function,
+        # we can pass v as the 'q' argument, as both need positional encoding.
+        v, k = apply_rotary_emb(v, k, cos, sin, seq_len=T, offset=0)
 
         # Reshape k and v back to (B, T, d_model)
-        k = k.view(B, T, D)
-        v = v.view(B, T, D)
+        k = k.transpose(1, 2).reshape(B, T, D)
+        v = v.transpose(1, 2).reshape(B, T, D)
 
         outputs = []
 
