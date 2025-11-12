@@ -130,187 +130,156 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 2048000 # was 1024
+    sequence_len: int = 2048000 # Added sequence_len
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.1
+    num_layers: int = 12 # Added num_layers for KVCache
+    n_head: int = 4
+    n_embd: int = 64
+    dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    rotary_seq_len: int = 2048000
+    rotary_seq_len: int = 16
     # LongRoPE additions:
     rotary_base: float = 10000.0  # same as usual RoPE base
     rotary_rescale_factors: Optional[torch.Tensor] = None  # shape (rotary_dim,)
     rotary_rescale_headwise: bool = False  # if using per-head vs per-dim
     rotary_short_threshold: int = 8192  # length under which we use short-readjust factors
+    rotary_critical_dim: Optional[int] = None
+    rotary_interpolation_strategy: Optional[str] = None
+    longrope_progressive_stages: Optional[List[int]] = None
+    rotary_readjust_short_k: Optional[bool] = None
+    rotary_readjust_lengths: Optional[List[int]] = None
+    rotary_readjust_map: Optional[List[int]] = None # Added this based on the previous error
     # progressive strategy
     longrope_stages: List[int] = field(default_factory=lambda: [256_000, 2_048_000])  # staged target lengths
     attention_type: str = "mha" # "mha" for MultiHeadSelfAttention, "kimi" for KimiLinearAttention
     state_size: int = 128 # For KimiLinearAttention
     rank: int = 16 # For KimiLinearAttention
     chunk_size: int = 16 # For KimiLinearAttention
+    
+    # For KimiLinearAttention
+    decay_rate: float = 0.999
+    clamp_val: float = 1.0
+    
+    # For Abacus
+    num_concept_ids: int = 1000
+    hypercube_dim: int = 128
+    abacus_input_dim: int = 256
+    
+    # For RoPE
+    rope_theta: int = 10000
+    
+    # For Muon
+    n_kv_head: Optional[int] = None
+    multiple_of: int = 256
+    norm_eps: float = 1e-5
+    
+    # For training
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 1
+    max_iters: int = 0
+    lr: float = 6e-4
+    min_lr: float = 6e-5
+    weight_decay: float = 1e-1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    grad_clip: float = 1.0
+    decay_lr: bool = True
+    warmup_iters: int = 2000
+    lr_decay_iters: int = 600000
+    
+    # For checkpointing
+    out_dir: str = 'out'
+    eval_interval: int = 2000
+    log_interval: int = 1
+    eval_iters: int = 200
+    eval_only: bool = False
+    always_save_checkpoint: bool = True
+    
+    # For distributed training
+    backend: str = 'nccl'
+    
+    # For system
+    device: str = 'cpu'
+    dtype: str = 'bfloat16'
+    compile: bool = False
+    
+    # For data
+    dataset: str = 'openwebtext'
+    
+    # For inference
+    init_from: str = 'scratch'
+    
+    # For chat
+    chat: bool = False
+    
+    # For concept
+    concept_memory_size: int = 1000
+    concept_memory_top_k: int = 5
+    use_concept_attention: bool = False
+    
+    # For psyche
+    psyche_id_lr_scale: float = 1.0
+    psyche_ego_lr_scale: float = 1.0
+    psyche_superego_lr_scale: float = 1.0
+    id_loss_weight: float = 0.2 # New hyperparameter for deep supervision
+    ego_loss_weight: float = 0.2 # New hyperparameter for deep supervision
+    superego_loss_weight: float = 0.2 # New hyperparameter for deep supervision
 
-    def __init__(self,
-                 block_size=2048000,
-                 vocab_size=50304,
-                 n_layer=12,
-                 n_head=12,
-                 n_embd=768,
-                 dropout=0.0,
-                 bias=True,
-                 attention_type="mha",
-                 state_size=128,
-                 rank=16,
-                 chunk_size=16,
-                 
-                 # For KimiLinearAttention
-                 decay_rate=0.999,
-                 clamp_val=1.0,
-                 
-                 # For Abacus
-                 num_concept_ids=1000,
-                 hypercube_dim=128,
-                 abacus_input_dim=256,
-                 
-                 # For RoPE
-                 rope_theta=10000,
-                 
-                 # For Muon
-                 n_kv_head=None,
-                 multiple_of=256,
-                 norm_eps=1e-5,
-                 
-                 # For training
-                 batch_size=1,
-                 gradient_accumulation_steps=1,
-                 max_iters=0,
-                 lr=6e-4,
-                 min_lr=6e-5,
-                 weight_decay=1e-1,
-                 beta1=0.9,
-                 beta2=0.95,
-                 grad_clip=1.0,
-                 decay_lr=True,
-                 warmup_iters=2000,
-                 lr_decay_iters=600000,
-                 
-                 # For checkpointing
-                 out_dir='out',
-                 eval_interval=2000,
-                 log_interval=1,
-                 eval_iters=200,
-                 eval_only=False,
-                 always_save_checkpoint=True,
-                 
-                 # For distributed training
-                 backend='nccl',
-                 
-                 # For system
-                 device='cpu',
-                 dtype='bfloat16',
-                 compile=False,
-                 
-                 # For data
-                 dataset='openwebtext',
-                 
-                 # For inference
-                 init_from='scratch',
-                 
-                 # For chat
-                 chat=False,
-                 
-                 # For concept
-                 concept_memory_size=1000,
-                 concept_memory_top_k=5,
-                 use_concept_attention=False,
-                 
-                 # For psyche
-                 psyche_id_lr_scale=1.0,
-                 psyche_ego_lr_scale=1.0,
-                 psyche_superego_lr_scale=1.0,
-                 id_loss_weight=0.2, # New hyperparameter for deep supervision
-                 ego_loss_weight=0.2, # New hyperparameter for deep supervision
-                 superego_loss_weight=0.2, # New hyperparameter for deep supervision
-                 **kwargs):
-        self.block_size = 2048000
-        self.vocab_size = vocab_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.dropout = dropout
-        self.bias = bias
-        self.attention_type = attention_type
-        self.state_size = state_size
-        self.rank = rank
-        self.chunk_size = chunk_size
-        self.decay_rate = decay_rate
-        self.clamp_val = clamp_val
-        self.num_concept_ids = num_concept_ids
-        self.hypercube_dim = hypercube_dim
-        self.abacus_input_dim = abacus_input_dim
-        self.rope_theta = rope_theta
-        self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
-        self.multiple_of = multiple_of
-        self.norm_eps = norm_eps
-        self.batch_size = batch_size
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.max_iters = max_iters
-        self.lr = lr
-        self.min_lr = min_lr
-        self.weight_decay = weight_decay
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.grad_clip = grad_clip
-        self.decay_lr = decay_lr
-        self.warmup_iters = warmup_iters
-        self.lr_decay_iters = lr_decay_iters
-        self.out_dir = out_dir
-        self.eval_interval = eval_interval
-        self.log_interval = log_interval
-        self.eval_iters = eval_iters
-        self.eval_only = eval_only
-        self.always_save_checkpoint = always_save_checkpoint
-        
-        # LongRoPE specific configurations
-        self.rotary_seq_len = 2048000 # Largest precomputed length
-        self.rotary_rescale_factors = None
-        self.rotary_critical_dim = rotary_critical_dim
-        self.rotary_interpolation_strategy = rotary_interpolation_strategy
-        self.longrope_progressive_stages = longrope_progressive_stages
-        self.rotary_readjust_short_k = rotary_readjust_short_k
-        self.rotary_readjust_lengths = rotary_readjust_lengths
-        self.rotary_readjust_map = rotary_readjust_map
-        self.rotary_rescale_headwise = False
 
-        self.multiple_of = multiple_of
-        self.norm_eps = norm_eps
-        self.batch_size = batch_size
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.max_iters = max_iters
-        self.lr = lr
-        self.min_lr = min_lr
-        self.weight_decay = weight_decay
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.grad_clip = grad_clip
-        self.decay_lr = decay_lr
-        self.warmup_iters = warmup_iters
-        self.lr_decay_iters = lr_decay_iters
-        self.out_dir = out_dir
-        self.eval_interval = eval_interval
-        self.log_interval = log_interval
-        self.eval_iters = eval_iters
-        self.eval_only = eval_only
-        self.always_save_checkpoint = always_save_checkpoint
-            
-            # LongRoPE specific configurations
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.dtype = dtype
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            id_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ego_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            superego_layers = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.concept_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.psyche_controller = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # with weight tying when using torch.compile() and DDP, this avoids expensive fp32 copy
+        self.transformer.wte.weight = self.lm_head.weight 
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print0("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def get_num_params(self, non_embedding=True):
+        """Return the number of parameters in the model. If non_embedding=True, then only count parameters in the transformer blocks."""
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+            n_params -= self.transformer.wte.weight.numel()
+        return n_params
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def to_empty(self, device: torch.device):
+        return super().to_empty(device=device)
 
         # token embeddings
         self.transformer = nn.ModuleDict(dict(
@@ -334,7 +303,7 @@ class GPT(nn.Module):
         self.psyche_controller = nn.Linear(config.n_embd, 3, bias=False) # 3 for id, ego, superego
 
         # kv cache
-        self.kv_cache = KVCache(config.block_size, config.n_head, config.n_embd // config.n_head, config.batch_size)
+        self.kv_cache = KVCache(config.block_size, config.n_head, config.n_embd // config.n_head, config.batch_size, config.num_layers)
 
         # rotary embeddings
         self.init_rotary_cache(self.config.rotary_seq_len, self.get_device())
@@ -429,9 +398,10 @@ class GPT(nn.Module):
         # zero out concept_head weights
         torch.nn.init.zeros_(self.concept_head.weight)
         # zero out c_proj weights in all blocks
-        for block in self.transformer.h:
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+        for block_list in [self.transformer.id_layers, self.transformer.ego_layers, self.transformer.superego_layers]:
+            for block in block_list:
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
         # Initialize rotary cache
         self.init_rotary_cache(self.config.rotary_seq_len, self.get_device())
 
@@ -461,10 +431,14 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, concept_head)
-        # matrix_params = list(self.transformer.h.parameters())
-        id_params = list(self.id_layers.parameters())
-        ego_params = list(self.ego_layers.parameters())
-        superego_params = list(self.superego_layers.parameters())
+        matrix_params = []
+        for block_list in [self.transformer.id_layers, self.transformer.ego_layers, self.transformer.superego_layers]:
+            for block in block_list:
+                matrix_params.extend(list(block.parameters()))
+
+        id_params = list(self.transformer.id_layers.parameters())
+        ego_params = list(self.transformer.ego_layers.parameters())
+        superego_params = list(self.transformer.superego_layers.parameters())
 
         embedding_params = [] # No separate embedding layer now
         concept_head_params = list(self.concept_head.parameters()) # New concept head params
@@ -488,11 +462,11 @@ class GPT(nn.Module):
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the Muon optimizer for the linear layers
-        # muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
-        # MuonFactory = DistMuon if ddp else Muon
-        # muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
-        optimizers = [adamw_optimizer]
+        optimizers = [adamw_optimizer, muon_optimizer]
         for opt in optimizers:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]

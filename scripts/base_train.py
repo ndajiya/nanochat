@@ -18,7 +18,6 @@ from contextlib import nullcontext
 
 import wandb
 import torch
-
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -35,15 +34,15 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
-depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
+depth = 4 # the depth of the Transformer model to train, rest of the kwargs are derived
+max_seq_len = 16 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
-num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
+num_iterations = 15 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
-target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
+target_param_data_ratio = -1 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 32 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
+device_batch_size = 1 # per-device batch size (set to not OOM)
+total_batch_size = 64 # total desired batch size, in #tokens
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
@@ -54,8 +53,8 @@ warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
-eval_tokens = 20*524288 # number of tokens to evaluate val loss on
-core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
+eval_tokens = 512 # number of tokens to evaluate val loss on
+core_metric_every = -1 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 # Output
@@ -107,8 +106,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    gptconf = GPTConfig(**model_config_kwargs)
+    model = GPT(gptconf, dtype=torch.float16)
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
@@ -192,12 +191,10 @@ for step in range(num_iterations + 1):
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        if val_bpb < min_val_bpb:
+            min_val_bpb = val_bpb
+        print0(f"Wandb Log: step={step}, total_training_flops={flops_so_far}, total_training_time={total_training_time}, val/bpb={val_bpb}")
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -208,12 +205,7 @@ for step in range(num_iterations + 1):
         with autocast_ctx:
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
+        print0(f"Wandb Log: step={step}, total_training_flops={flops_so_far}, core_metric={results["core_metric"]}, centered_results={results["centered_results"]}")
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -317,7 +309,7 @@ for step in range(num_iterations + 1):
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
-        wandb_run.log(log_data)
+        print0(f"Wandb Log: {log_data}")
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -351,5 +343,5 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+# wandb_run.finish() # wandb run finish
 compute_cleanup()
