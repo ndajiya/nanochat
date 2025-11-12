@@ -14,7 +14,7 @@ Notable features:
 import copy
 import math
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from typing import Optional, List
 
@@ -27,6 +27,7 @@ from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 from nanochat.attention.kimi import KimiLinearAttention
 from nanochat.kv_cache import KVCache
+from nanochat.utils import apply_rotary_pos_emb, rotate_half
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch's LayerNorm
@@ -128,28 +129,28 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 16000 # was 1024
+    block_size: int = 2048000 # was 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.1
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    rotary_seq_len: int = 16384
+    rotary_seq_len: int = 2048000
     # LongRoPE additions:
     rotary_base: float = 10000.0  # same as usual RoPE base
     rotary_rescale_factors: Optional[torch.Tensor] = None  # shape (rotary_dim,)
     rotary_rescale_headwise: bool = False  # if using per-head vs per-dim
     rotary_short_threshold: int = 8192  # length under which we use short-readjust factors
     # progressive strategy
-    longrope_stages: List[int] = [256_000, 2_048_000]  # staged target lengths
+    longrope_stages: List[int] = field(default_factory=lambda: [256_000, 2_048_000])  # staged target lengths
     attention_type: str = "mha" # "mha" for MultiHeadSelfAttention, "kimi" for KimiLinearAttention
     state_size: int = 128 # For KimiLinearAttention
     rank: int = 16 # For KimiLinearAttention
     chunk_size: int = 16 # For KimiLinearAttention
 
     def __init__(self,
-                 block_size=1024,
+                 block_size=2048000,
                  vocab_size=50304,
                  n_layer=12,
                  n_head=12,
@@ -230,7 +231,7 @@ class GPTConfig:
                  ego_loss_weight=0.2, # New hyperparameter for deep supervision
                  superego_loss_weight=0.2, # New hyperparameter for deep supervision
                  **kwargs):
-        self.block_size = block_size
+        self.block_size = 2048000
         self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
@@ -270,53 +271,36 @@ class GPTConfig:
         self.always_save_checkpoint = always_save_checkpoint
         
         # LongRoPE specific configurations
-        rotary_seq_len: int = 16384, # Largest precomputed length
-        rotary_rescale_factors: list[float] | None = None,
-        rotary_critical_dim: int | None = None,
-        rotary_interpolation_strategy: str = "uniform", # 'uniform' | 'non_uniform' | 'second_interpolation'
-        longrope_progressive_stages: list[int] | None = None,
-        rotary_readjust_short_k: bool = False,
-        rotary_readjust_lengths: list[int] | None = None,
-        rotary_readjust_map: dict | None = None,
-        **kwargs):
-            self.block_size = block_size
-            self.vocab_size = vocab_size
-            self.n_layer = n_layer
-            self.n_head = n_head
-            self.n_embd = n_embd
-            self.dropout = dropout
-            self.bias = bias
-            self.attention_type = attention_type
-            self.state_size = state_size
-            self.rank = rank
-            self.chunk_size = chunk_size
-            self.decay_rate = decay_rate
-            self.clamp_val = clamp_val
-            self.num_concept_ids = num_concept_ids
-            self.hypercube_dim = hypercube_dim
-            self.abacus_input_dim = abacus_input_dim
-            self.rope_theta = rope_theta
-            self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
-            self.multiple_of = multiple_of
-            self.norm_eps = norm_eps
-            self.batch_size = batch_size
-            self.gradient_accumulation_steps = gradient_accumulation_steps
-            self.max_iters = max_iters
-            self.lr = lr
-            self.min_lr = min_lr
-            self.weight_decay = weight_decay
-            self.beta1 = beta1
-            self.beta2 = beta2
-            self.grad_clip = grad_clip
-            self.decay_lr = decay_lr
-            self.warmup_iters = warmup_iters
-            self.lr_decay_iters = lr_decay_iters
-            self.out_dir = out_dir
-            self.eval_interval = eval_interval
-            self.log_interval = log_interval
-            self.eval_iters = eval_iters
-            self.eval_only = eval_only
-            self.always_save_checkpoint = always_save_checkpoint
+        self.rotary_seq_len = 2048000 # Largest precomputed length
+        self.rotary_rescale_factors = None
+        self.rotary_critical_dim = rotary_critical_dim
+        self.rotary_interpolation_strategy = rotary_interpolation_strategy
+        self.longrope_progressive_stages = longrope_progressive_stages
+        self.rotary_readjust_short_k = rotary_readjust_short_k
+        self.rotary_readjust_lengths = rotary_readjust_lengths
+        self.rotary_readjust_map = rotary_readjust_map
+        self.rotary_rescale_headwise = False
+
+        self.multiple_of = multiple_of
+        self.norm_eps = norm_eps
+        self.batch_size = batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.max_iters = max_iters
+        self.lr = lr
+        self.min_lr = min_lr
+        self.weight_decay = weight_decay
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.grad_clip = grad_clip
+        self.decay_lr = decay_lr
+        self.warmup_iters = warmup_iters
+        self.lr_decay_iters = lr_decay_iters
+        self.out_dir = out_dir
+        self.eval_interval = eval_interval
+        self.log_interval = log_interval
+        self.eval_iters = eval_iters
+        self.eval_only = eval_only
+        self.always_save_checkpoint = always_save_checkpoint
             
             # LongRoPE specific configurations
 

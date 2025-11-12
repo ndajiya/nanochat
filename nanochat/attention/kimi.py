@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nanochat.gpt import apply_rotary_emb # Import apply_rotary_emb
+from nanochat.utils import apply_rotary_pos_emb
 
 class KimiLinearAttention(nn.Module):
     def __init__(self, config):
